@@ -23,11 +23,22 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
+        # device selection: prefer CUDA when available, otherwise CPU (macOS)
+        self.use_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.use_cuda else "cpu")
+        # Force eager mode when CUDA is not available (no CUDAGraph support)
+        if not self.use_cuda:
+            self.enforce_eager = True
+
+        # select distributed backend appropriate for device
+        backend = "nccl" if self.use_cuda else "gloo"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if self.use_cuda:
+            torch.cuda.set_device(rank)
+            default_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(hf_config.torch_dtype)
+            torch.set_default_device("cuda")
+
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -35,8 +46,9 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        if self.use_cuda:
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -55,7 +67,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        if self.use_cuda:
+            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -89,27 +102,34 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        if self.use_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
-        torch.cuda.empty_cache()
+        if self.use_cuda:
+            torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        if self.use_cuda:
+            free, total = torch.cuda.mem_get_info()
+            used = total - free
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+            assert config.num_kvcache_blocks > 0
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        else:
+            # CPU fallback: pick a modest number of KV cache blocks based on config
+            config.num_kvcache_blocks = max(1, config.max_num_batched_tokens // self.block_size)
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=self.device)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -120,7 +140,8 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        pin = True if self.use_cuda else False
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -153,11 +174,12 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        pin = True if self.use_cuda else False
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin).to(self.device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=pin).to(self.device, non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -171,10 +193,11 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        pin = True if self.use_cuda else False
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin).to(self.device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=pin).to(self.device, non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=pin).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
@@ -183,7 +206,8 @@ class ModelRunner:
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        pin = True if self.use_cuda else False
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=pin).to(self.device, non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
@@ -217,14 +241,22 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        # CUDA graphs are only supported when CUDA is available
+        if not self.use_cuda:
+            self.graph_bs = []
+            self.graphs = {}
+            self.graph_pool = None
+            self.graph_vars = {}
+            return
+
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=self.device)
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=self.device)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=self.device)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, device=self.device)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
