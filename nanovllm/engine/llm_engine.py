@@ -18,16 +18,22 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        # On non-CUDA devices we force single-process execution and eager mode
+        if config.device != "cuda":
+            config.tensor_parallel_size = 1
+            config.enforce_eager = True
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        # spawn worker processes only for CUDA tensor-parallel runs
+        if config.device == "cuda" and config.tensor_parallel_size > 1:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+        self.model_runner = ModelRunner(config, 0, self.events if self.events else None)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
