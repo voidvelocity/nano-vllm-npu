@@ -71,6 +71,20 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def truncate(self, keep_tokens: int):
+        keep_tokens = max(1, keep_tokens)
+        if self.num_tokens <= keep_tokens:
+            return
+        completion = self.token_ids[self.num_prompt_tokens:self.num_tokens]
+        keep_prompt = min(self.num_prompt_tokens, keep_tokens)
+        prompt_start = self.num_prompt_tokens - keep_prompt
+        kept_prompt_tokens = self.token_ids[prompt_start:self.num_prompt_tokens]
+        self.token_ids = kept_prompt_tokens + completion
+        self.num_prompt_tokens = keep_prompt
+        self.num_tokens = len(self.token_ids)
+        self.num_cached_tokens = min(self.num_cached_tokens, self.num_tokens)
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)

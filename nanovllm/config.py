@@ -16,6 +16,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    enable_snapkv: bool = False
+    snapkv_limit: int | None = None
+    snapkv_attn_sample_queries: int = 128
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -24,3 +27,9 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.snapkv_limit is not None:
+            assert self.snapkv_limit > 0
+        if self.enable_snapkv and self.snapkv_limit is None:
+            self.snapkv_limit = self.max_model_len
+        if self.snapkv_attn_sample_queries is not None:
+            assert self.snapkv_attn_sample_queries > 0

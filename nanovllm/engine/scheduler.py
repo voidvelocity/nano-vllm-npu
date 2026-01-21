@@ -69,3 +69,35 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def truncate_sequence_kv(self, seq: Sequence, sparse_limit: int):
+        if seq.num_tokens <= sparse_limit:
+            return
+        
+        # 1. Truncate the sequence meta-data (tokens)
+        seq.truncate(sparse_limit)
+        
+        # 2. Recycle blocks based on the new total length
+        # Note: seq.num_tokens includes the just-generated completion token(s)
+        new_num_blocks = seq.num_blocks # Property automatically calculates based on num_tokens
+        old_num_blocks = len(seq.block_table)
+
+        if new_num_blocks < old_num_blocks:
+            for _ in range(old_num_blocks - new_num_blocks):
+                block_id = seq.block_table.pop()
+                if block_id < len(self.block_manager.blocks):
+                    block = self.block_manager.blocks[block_id]
+                    assert block.ref_count > 0
+                    block.ref_count -= 1
+                    if block.ref_count == 0:
+                        self.block_manager._deallocate_block(block_id)
+
+        # 3. Reset the hash of the last block to ensure it's writable/extendable
+        if seq.block_table:
+            last_block_id = seq.block_table[-1]
+            last_block = self.block_manager.blocks[last_block_id]
+            # Since we modified the block content (by truncation) and it's now the active tail,
+            # we must check ownership and reset hash.
+            # SnapKV logic assumes no prefix sharing (ref_count == 1).
+            if last_block.ref_count == 1:
+                last_block.hash = -1
