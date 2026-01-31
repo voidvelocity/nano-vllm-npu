@@ -2,6 +2,10 @@ import os
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+# Supress errors from _dynamo to avoid exiting the program.
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 
 def main():
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")

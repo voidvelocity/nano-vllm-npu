@@ -32,6 +32,9 @@ class Qwen3Attention(nn.Module):
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
+        # num_kv_heads: Number of head each TP
+        # head_dim: dimension of each head
+        # q_size: dimension of q vector
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -81,7 +84,12 @@ class Qwen3Attention(nn.Module):
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # each token has an sin/cos position, cached it, the use `positions` to index it.
         q, k = self.rotary_emb(positions, q, k)
+        # q: [N, num_heads, head_dim]     e.g. [2, 16, 128]
+        # k: [N, num_kv_heads, head_dim]  e.g. [2, 8, 128]
+        # v: [N, num_kv_heads, head_dim]  e.g. [2, 8, 128]
+        # print(f"-- In Qwen3Attention forward: {q.shape=}  {k.shape=}  {v.shape=}")
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
