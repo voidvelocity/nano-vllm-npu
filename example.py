@@ -1,9 +1,10 @@
 import os
-from nanovllm import LLM, SamplingParams
+from nanovllmnpu import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-# Supress errors from _dynamo to avoid exiting the program.
+# Suppress errors from _dynamo to avoid exiting the program.
 import torch._dynamo
+
 torch._dynamo.config.suppress_errors = True
 
 
@@ -19,11 +20,13 @@ def main():
     ]
     prompts = [
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            [{
+                "role": "user",
+                "content": prompt
+            }],
             tokenize=False,
             add_generation_prompt=True,
-        )
-        for prompt in prompts
+        ) for prompt in prompts
     ]
     outputs = llm.generate(prompts, sampling_params)
 

@@ -1,17 +1,11 @@
 from typing import Optional, Union
 import torch
 from torch import nn
-import torch.nn.functional as F
-from nanovllm.utils.context import get_context
+from nanovllmnpu.utils.context import get_context
 
 
-def store_kvcache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor
-):
+def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
+                  v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     """
     The k_cache and v_cache is global cache that store all cached k,v, instead of current `key` and `value`.
 
@@ -54,16 +48,16 @@ def _scaled_dot_product_attention(q, k, v, scale, causal):
     Tq, Hq, D = q.shape
     Tk, Hk, _ = k.shape
     Tv, Hv, _ = v.shape
-    H = Hk                  # base is Hk
+    H = Hk  # base is Hk
     # ---- GQA / MQA handling ----
     assert Hq % H == 0, f"Hq={Hq} must be divisible by Hk={Hk}"
     assert H == Hv
 
     group_size = Hq // H
 
-    q = q.reshape(Tq, H, group_size, D)        # [Tq, H, g, D]
-    k = k.reshape(Tk, H, 1, D)                 # [Tk, H, 1, D]
-    v = v.reshape(Tk, H, 1, D)                 # [Tv, H, 1, D]
+    q = q.reshape(Tq, H, group_size, D)  # [Tq, H, g, D]
+    k = k.reshape(Tk, H, 1, D)  # [Tk, H, 1, D]
+    v = v.reshape(Tk, H, 1, D)  # [Tv, H, 1, D]
 
     # scores: [Tq, H, g, D] @ [Tk, H, 1(broadcast to group_size), D] -> [H, g, Tq, Tk]
     scores = torch.einsum("qhgd,khgd->hgqk", q, k) * scale
@@ -151,7 +145,7 @@ def attention_varlen_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -187,7 +181,7 @@ def attention_varlen_func(
     assert softcap == 0.0
 
     total_q, nheads, headdim = q.shape
-    scale = softmax_scale or (1.0 / headdim ** 0.5)
+    scale = softmax_scale or (1.0 / headdim**0.5)
 
     batch_size = cu_seqlens_q.numel() - 1
     out = torch.empty_like(q)
@@ -196,15 +190,13 @@ def attention_varlen_func(
         q_start, q_end = cu_seqlens_q[b], cu_seqlens_q[b + 1]
         k_start, k_end = cu_seqlens_k[b], cu_seqlens_k[b + 1]
 
-        qb = q[q_start:q_end]   # [Lq, Hq, D]
-        kb = k[k_start:k_end]   # [Lk, Hk, D]
-        vb = v[k_start:k_end]   # [Lv, Hv, D]
+        qb = q[q_start:q_end]  # [Lq, Hq, D]
+        kb = k[k_start:k_end]  # [Lk, Hk, D]
+        vb = v[k_start:k_end]  # [Lv, Hv, D]
 
         # print(f"---- in attention_varlen_func {q.shape=} {qb.shape=}")
 
-        out[q_start:q_end] = _scaled_dot_product_attention(
-            qb, kb, vb, scale, causal
-        )
+        out[q_start:q_end] = _scaled_dot_product_attention(qb, kb, vb, scale, causal)
 
     return out
 
@@ -224,7 +216,7 @@ def attention_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
@@ -268,9 +260,9 @@ def attention_with_kvcache(
     assert not return_softmax_lse
     assert softcap == 0.0
 
-    B, T, Hq, D = q.shape   # `T` should be 1
+    B, T, Hq, D = q.shape  # `T` should be 1
     Hk = k_cache.size(2)
-    scale = softmax_scale or (1.0 / D ** 0.5)
+    scale = softmax_scale or (1.0 / D**0.5)
 
     out = torch.empty_like(q)
 
@@ -279,14 +271,10 @@ def attention_with_kvcache(
         qb = q[b]  # (T=1, H, D)
 
         # Gather KV
-        kb, vb = _gather_kv_from_cache(
-            k_cache, v_cache, block_table[b], seqlen, Hk, D
-        )
+        kb, vb = _gather_kv_from_cache(k_cache, v_cache, block_table[b], seqlen, Hk, D)
 
         # (T=1, H, D)
-        out_b = _scaled_dot_product_attention(
-            qb, kb, vb, scale, causal
-        )
+        out_b = _scaled_dot_product_attention(qb, kb, vb, scale, causal)
         out[b, 0] = out_b[0]
 
     return out
@@ -315,14 +303,24 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None:  # prefix cache
                 k, v = k_cache, v_cache
-            o = attention_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = attention_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True)
+            o = attention_varlen_func(q,
+                                      k,
+                                      v,
+                                      max_seqlen_q=context.max_seqlen_q,
+                                      cu_seqlens_q=context.cu_seqlens_q,
+                                      max_seqlen_k=context.max_seqlen_k,
+                                      cu_seqlens_k=context.cu_seqlens_k,
+                                      softmax_scale=self.scale,
+                                      causal=True,
+                                      block_table=context.block_tables)
+        else:  # decode
+            o = attention_with_kvcache(q.unsqueeze(1),
+                                       k_cache,
+                                       v_cache,
+                                       cache_seqlens=context.context_lens,
+                                       block_table=context.block_tables,
+                                       softmax_scale=self.scale,
+                                       causal=True)
         return o

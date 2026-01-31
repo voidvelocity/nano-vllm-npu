@@ -5,11 +5,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from nanovllmnpu.config import Config
+from nanovllmnpu.sampling_params import SamplingParams
+from nanovllmnpu.engine.sequence import Sequence
+from nanovllmnpu.engine.scheduler import Scheduler
+from nanovllmnpu.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
@@ -87,7 +87,10 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{
+            "text": self.tokenizer.decode(token_ids),
+            "token_ids": token_ids
+        } for token_ids in outputs]
         if use_tqdm:
             pbar.close()
         return outputs

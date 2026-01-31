@@ -23,6 +23,9 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
@@ -31,24 +34,25 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
-Note: 
+Note:
 - In my test, `enforce_eager` should always set as `True`. (I don't why now)
 - I `export ASCEND_LAUNCH_BLOCKING=1`, I'm not sure if it's necessary.
+- `torch._dynamo.config.suppress_errors = True` is needed to suppress errors from _dynamo.
 
 
 ## Compare with `nano-vllm`
 
 Main changes compared with [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git)
 
-- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) runs on GPU, while `nano-vllm-npu` runs on NPU. 
+- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) runs on GPU, while `nano-vllm-npu` runs on NPU.
 In the code, `torch.cuda` is replaced by `torch.npu` and `CUDAGraph` by `NPUGraph`.
-- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) uses [flash-attention](https://github.com/Dao-AILab/flash-attention.git) to optimize the performance. 
-While currently we just try to write attention by pytorch, which is much slower. We'll optimize it in the future.
+- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) uses [flash-attention](https://github.com/Dao-AILab/flash-attention.git) to optimize the performance.
+While currently we just try to write attention by pytorch in my `nano-vllm-npu`, which is much slower. We'll optimize it in the future.
 
 
 ## Demo
 
-- Hardware: 
+- Hardware:
 - CANN Version:
 - PyTorch Version:
 - Torch NPU Version:
@@ -58,20 +62,20 @@ Output:
 ```log
 # git clone https://github.com/voidvelocity/nano-vllm-npu.git
 # cd nano-vllm-npu
-# python example.py 
-[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] WON'T CONVERT rms_forward /home/my_demo/nano-vllm-npu/nanovllm/layers/layernorm.py line 16 
-[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] due to: 
+# python example.py
+[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] WON'T CONVERT rms_forward /home/my_demo/nano-vllm-npu/nanovllm/layers/layernorm.py line 16
+[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] due to:
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] Traceback (most recent call last):
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING]   File "/usr/local/lib/python3.11/site-packages/torch_npu/utils/_dynamo.py", line 428, in _check_wrapper_exist
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING]     raise AssertionError(f"Device {device_type} not supported" + pta_error(ErrCode.NOT_SUPPORT))
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] AssertionError: Device npu not supported
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] [ERROR] 2026-01-31-17:52:38 (PID:3862154, Device:0, RankID:0) ERR00007 PTA feature not supported
-[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] 
+[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING]
 [rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
-[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING] 
+[rank0]:[2026-01-31 17:52:38,326] torch._dynamo.convert_frame: [WARNING]
 ...
-[rank0]:[2026-01-31 17:52:41,046] torch._dynamo.convert_frame: [WARNING] 
+[rank0]:[2026-01-31 17:52:41,046] torch._dynamo.convert_frame: [WARNING]
 Generating: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [04:39<00:00, 139.61s/it, Prefill=68tok/s, Decode=0tok/s]
 
 

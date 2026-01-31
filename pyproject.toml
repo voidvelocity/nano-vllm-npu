@@ -3,25 +3,23 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
-license = "MIT"
-license-files = ["LICENSE"]
+name = "nano-vllm-npu"
+version = "0.0.1"
+authors = [{ name = "VoidVelocity" }]
+license = { file = "LICENSE" }
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "a lightweight vLLM implementation built from scratch and runs on NPU."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
-    "triton>=3.0.0",
+    "torch-npu>=2.4.0",
     "transformers>=4.51.0",
-    "flash-attn",
     "xxhash",
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/voidvelocity/nano-vllm-npu"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nanovllm*"]
+include = ["nanovllmnpu*"]
