@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-vllm-npu"
-version = "0.0.1"
+version = "0.0.1.post1"
 authors = [{ name = "VoidVelocity" }]
 license = { file = "LICENSE" }
 readme = "README.md"

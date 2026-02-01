@@ -2,7 +2,7 @@
 
 A lightweight vLLM implementation built from scratch.
 
-Nano-vllm-npu forks from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git), adapts it to Ascend npu.
+Nano-vllm-npu originally forks from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git), then adapts it to Ascend NPU.
 
 ## Installation
 
@@ -46,8 +46,8 @@ Main changes compared with [nano-vllm](https://github.com/GeeeekExplorer/nano-vl
 
 - [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) runs on GPU, while `nano-vllm-npu` runs on NPU.
 In the code, `torch.cuda` is replaced by `torch.npu` and `CUDAGraph` by `NPUGraph`.
-- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) uses [flash-attention](https://github.com/Dao-AILab/flash-attention.git) to optimize the performance.
-While currently we just try to write attention by pytorch in my `nano-vllm-npu`, which is much slower. We'll optimize it in the future.
+- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git) uses triton and [flash-attention](https://github.com/Dao-AILab/flash-attention.git) to optimize kv-cache store and attention, which improves performance.
+While currently we just try to write attention by pytorch, which is much slower. We'll optimize it in the future. More see file [nanovllmnpu/layers/attention.py](nanovllmnpu/layers/attention.py), you can compare with [nanovllm/layers/attention.py](https://github.com/GeeeekExplorer/nano-vllm/blob/main/nanovllm/layers/attention.py).
 
 
 ## Demo
