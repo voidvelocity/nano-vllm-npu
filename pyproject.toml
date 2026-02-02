@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-vllm-npu"
-version = "0.0.1.post1"
+version = "0.0.2"
 authors = [{ name = "VoidVelocity" }]
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -13,6 +13,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
     "torch-npu>=2.4.0",
+    "triton-ascend",
     "transformers>=4.51.0",
     "xxhash",
 ]

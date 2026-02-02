@@ -4,6 +4,10 @@ A lightweight vLLM implementation built from scratch.
 
 Nano-vllm-npu originally forks from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm.git), then adapts it to Ascend NPU.
 
+## changes
+
+- 2026/02/02 Using triton-ascend to optimize kv-cache load and store in file `nanovllmnpu/layers/attention.py`. `generate` in `example.py` time varies from `219 seconds` to `43 seconds`, 5x faster.
+
 ## Installation
 
 ```bash

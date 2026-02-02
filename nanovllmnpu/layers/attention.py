@@ -1,39 +1,119 @@
 from typing import Optional, Union
 import torch
 from torch import nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
 from nanovllmnpu.utils.context import get_context
 
 
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
-                  v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    """
-    The k_cache and v_cache is global cache that store all cached k,v, instead of current `key` and `value`.
+@triton.jit
+def store_kvcache_kernel(
+    key_ptr,
+    key_stride,
+    value_ptr,
+    value_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1: return
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
-    key:          (N, num_kv_heads, head_dim)
-    value:        (N, num_kv_heads, head_dim)
-    k_cache:      (num_blocks, block_size, num_kv_heads, head_dim)
-    v_cache:      (num_blocks, block_size, num_kv_heads, head_dim)
-    slot_mapping: (N,)
-    """
-    assert key.ndim == 3
-    assert value.ndim == 3
-    assert k_cache.ndim == 4
-    assert v_cache.ndim == 4
-    assert slot_mapping.ndim == 1
 
-    N, num_kv_heads, head_dim = key.shape
-    block_size = k_cache.shape[1]
+def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert slot_mapping.numel() == N
+    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
-    for i in range(N):
-        slot = int(slot_mapping[i])
-        if slot < 0:
-            continue
 
-        block_id = slot // block_size
-        offset = slot % block_size
+@triton.jit
+def kv_cache_gather_kernel(
+    k_cache_ptr,
+    v_cache_ptr,
+    block_table_ptr,   # [num_blocks_used]
+    k_out_ptr,         # [seqlen, Hk, D]
+    v_out_ptr,
 
-        k_cache[block_id, offset].copy_(key[i])
-        v_cache[block_id, offset].copy_(value[i])
+    stride_cache_b,
+    stride_cache_s,
+    stride_cache_h,
+    stride_cache_d,
+
+    stride_out_t,
+    stride_out_h,
+    stride_out_d,
+
+    block_size: tl.constexpr,
+    Hk: tl.constexpr,
+    D: tl.constexpr,
+):
+    pid = tl.program_id(0)  # token index
+
+    block_idx = pid // block_size
+    offset    = pid % block_size
+
+    block_id = tl.load(block_table_ptr + block_idx)
+
+    idx = tl.arange(0, Hk * D)
+    h = idx // D
+    d = idx % D
+
+    cache_offset = (
+        block_id * stride_cache_b
+        + offset * stride_cache_s
+        + h * stride_cache_h
+        + d * stride_cache_d
+    )
+
+    k = tl.load(k_cache_ptr + cache_offset)
+    v = tl.load(v_cache_ptr + cache_offset)
+
+    out_offset = (
+        pid * stride_out_t
+        + h * stride_out_h
+        + d * stride_out_d
+    )
+
+    tl.store(k_out_ptr + out_offset, k)
+    tl.store(v_out_ptr + out_offset, v)
+
+
+def kv_cache_gather(k_cache, v_cache, block_table, seqlen):
+    Hk = k_cache.shape[2]
+    D  = k_cache.shape[3]
+
+    k_out = torch.empty((seqlen, Hk, D), device=k_cache.device, dtype=k_cache.dtype)
+    v_out = torch.empty_like(k_out)
+
+    grid = (seqlen,)
+
+    kv_cache_gather_kernel[grid](
+        k_cache, v_cache, block_table,
+        k_out, v_out,
+        k_cache.stride(0), k_cache.stride(1),
+        k_cache.stride(2), k_cache.stride(3),
+        k_out.stride(0), k_out.stride(1), k_out.stride(2),
+        block_size=k_cache.shape[1],
+        Hk=Hk,
+        D=D,
+    )
+
+    return k_out, v_out
 
 
 def _scaled_dot_product_attention(q, k, v, scale, causal):
@@ -48,16 +128,16 @@ def _scaled_dot_product_attention(q, k, v, scale, causal):
     Tq, Hq, D = q.shape
     Tk, Hk, _ = k.shape
     Tv, Hv, _ = v.shape
-    H = Hk  # base is Hk
+    H = Hk                  # base is Hk
     # ---- GQA / MQA handling ----
     assert Hq % H == 0, f"Hq={Hq} must be divisible by Hk={Hk}"
     assert H == Hv
 
     group_size = Hq // H
 
-    q = q.reshape(Tq, H, group_size, D)  # [Tq, H, g, D]
-    k = k.reshape(Tk, H, 1, D)  # [Tk, H, 1, D]
-    v = v.reshape(Tk, H, 1, D)  # [Tv, H, 1, D]
+    q = q.reshape(Tq, H, group_size, D)        # [Tq, H, g, D]
+    k = k.reshape(Tk, H, 1, D)                 # [Tk, H, 1, D]
+    v = v.reshape(Tk, H, 1, D)                 # [Tv, H, 1, D]
 
     # scores: [Tq, H, g, D] @ [Tk, H, 1(broadcast to group_size), D] -> [H, g, Tq, Tk]
     scores = torch.einsum("qhgd,khgd->hgqk", q, k) * scale
@@ -92,47 +172,6 @@ def _scaled_dot_product_attention(q, k, v, scale, causal):
     return out
 
 
-def _gather_kv_from_cache(k_cache, v_cache, block_table, seqlen, num_kv_heads, head_dim):
-    """
-    ⚠️ Slow but correct reference implementation.
-
-    k_cache, v_cache:
-        (num_blocks, block_size, num_kv_heads, head_dim)
-
-    block_table:
-        (num_blocks_used,)  # token blocks in order
-
-    Returns:
-        k: (seqlen, num_kv_heads, head_dim)
-        v: (seqlen, num_kv_heads, head_dim)
-    """
-    assert k_cache.ndim == 4
-    assert block_table is not None
-
-    block_size = k_cache.shape[1]
-    device = k_cache.device
-
-    # print(f"=== {num_kv_heads=}  {k_cache.shape=}  {v_cache.shape=}")
-    k_out = torch.empty(
-        (seqlen, num_kv_heads, head_dim),
-        device=device,
-        dtype=k_cache.dtype,
-    )
-    v_out = torch.empty_like(k_out)
-
-    token_idx = 0
-    for block_id in block_table.tolist():
-        for offset in range(block_size):
-            if token_idx >= seqlen:
-                return k_out, v_out
-
-            k_out[token_idx].copy_(k_cache[block_id, offset])
-            v_out[token_idx].copy_(v_cache[block_id, offset])
-            token_idx += 1
-
-    return k_out, v_out
-
-
 def attention_varlen_func(
     q,
     k,
@@ -145,7 +184,7 @@ def attention_varlen_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0,  # 0.0 means deactivated
+    softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -181,7 +220,7 @@ def attention_varlen_func(
     assert softcap == 0.0
 
     total_q, nheads, headdim = q.shape
-    scale = softmax_scale or (1.0 / headdim**0.5)
+    scale = softmax_scale or (1.0 / headdim ** 0.5)
 
     batch_size = cu_seqlens_q.numel() - 1
     out = torch.empty_like(q)
@@ -190,13 +229,15 @@ def attention_varlen_func(
         q_start, q_end = cu_seqlens_q[b], cu_seqlens_q[b + 1]
         k_start, k_end = cu_seqlens_k[b], cu_seqlens_k[b + 1]
 
-        qb = q[q_start:q_end]  # [Lq, Hq, D]
-        kb = k[k_start:k_end]  # [Lk, Hk, D]
-        vb = v[k_start:k_end]  # [Lv, Hv, D]
+        qb = q[q_start:q_end]   # [Lq, Hq, D]
+        kb = k[k_start:k_end]   # [Lk, Hk, D]
+        vb = v[k_start:k_end]   # [Lv, Hv, D]
 
         # print(f"---- in attention_varlen_func {q.shape=} {qb.shape=}")
 
-        out[q_start:q_end] = _scaled_dot_product_attention(qb, kb, vb, scale, causal)
+        out[q_start:q_end] = _scaled_dot_product_attention(
+            qb, kb, vb, scale, causal
+        )
 
     return out
 
@@ -216,7 +257,7 @@ def attention_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0,  # 0.0 means deactivated
+    softcap=0.0, # 0.0 means deactivated
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
@@ -260,9 +301,9 @@ def attention_with_kvcache(
     assert not return_softmax_lse
     assert softcap == 0.0
 
-    B, T, Hq, D = q.shape  # `T` should be 1
+    B, T, Hq, D = q.shape   # `T` should be 1
     Hk = k_cache.size(2)
-    scale = softmax_scale or (1.0 / D**0.5)
+    scale = softmax_scale or (1.0 / D ** 0.5)
 
     out = torch.empty_like(q)
 
@@ -270,11 +311,17 @@ def attention_with_kvcache(
         seqlen = int(cache_seqlens[b])
         qb = q[b]  # (T=1, H, D)
 
-        # Gather KV
-        kb, vb = _gather_kv_from_cache(k_cache, v_cache, block_table[b], seqlen, Hk, D)
+        kb, vb = kv_cache_gather(
+            k_cache,
+            v_cache,
+            block_table[b],
+            seqlen,
+        )
 
         # (T=1, H, D)
-        out_b = _scaled_dot_product_attention(qb, kb, vb, scale, causal)
+        out_b = _scaled_dot_product_attention(
+            qb, kb, vb, scale, causal
+        )
         out[b, 0] = out_b[0]
 
     return out
@@ -303,24 +350,14 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            if context.block_tables is not None:  # prefix cache
+            if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            o = attention_varlen_func(q,
-                                      k,
-                                      v,
-                                      max_seqlen_q=context.max_seqlen_q,
-                                      cu_seqlens_q=context.cu_seqlens_q,
-                                      max_seqlen_k=context.max_seqlen_k,
-                                      cu_seqlens_k=context.cu_seqlens_k,
-                                      softmax_scale=self.scale,
-                                      causal=True,
-                                      block_table=context.block_tables)
-        else:  # decode
-            o = attention_with_kvcache(q.unsqueeze(1),
-                                       k_cache,
-                                       v_cache,
-                                       cache_seqlens=context.context_lens,
-                                       block_table=context.block_tables,
-                                       softmax_scale=self.scale,
-                                       causal=True)
+            o = attention_varlen_func(q, k, v,
+                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+        else:    # decode
+            o = attention_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                        softmax_scale=self.scale, causal=True)
         return o

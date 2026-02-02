@@ -1,4 +1,5 @@
 import os
+import time
 from nanovllmnpu import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -28,7 +29,11 @@ def main():
             add_generation_prompt=True,
         ) for prompt in prompts
     ]
+
+    t1 = time.time()
     outputs = llm.generate(prompts, sampling_params)
+    t2 = time.time()
+    print(f"Total spend {t2 - t1} seconds.")
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
